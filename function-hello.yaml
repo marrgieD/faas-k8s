@@ -6,9 +6,8 @@ metadata:
   namespace: default
 spec:
   code: |
-    # 这里的代码会被挂到 /var/faas/function/handler.py
-    # 实际执行方式由你的 runtime 镜像决定
-    print("hello from function")
+    def main():
+      return "hello from runner"
   runtime: python3.9
   minReplicas: 1
   maxReplicas: 3
