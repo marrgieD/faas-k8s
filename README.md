@@ -8,15 +8,114 @@
 - **并发与防惊群**：Gateway 网关内置流量拦截与内存锁机制，确保在缩容到 0 的状态下，突发高并发请求仅触发一次 Pod 扩容，其余请求优雅挂起等待。
 - **K8s 原生控制器**：基于 Python `kopf` 框架开发自定义 Operator，实现对 `Function` CRD 的生命周期自动化管理（自动对齐 Deployment 与 Service）。
 
----
-
 ## 🚀 快速开始 (Quick Start)
 
 以下指南将带你在本地 `kind` 集群中完整跑通整个 FaaS 流程。
 
 ### 1. 环境准备
+
 确保你已安装 `Docker`、`kubectl` 和 `kind`。
 创建一个测试用的本地集群：
+
 ```bash
 kind create cluster --name faas
 kubectl cluster-info
+```
+
+准备 Python 虚拟环境并安装核心依赖：
+
+```bash
+python3 -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
+```
+
+### 2. 构建核心镜像并装载至集群
+
+本系统包含两个核心镜像：负责执行 Python 源码的 **Runner** 镜像，以及负责流量拦截与转发的 **Gateway** 镜像。
+
+```bash
+# 1. 构建并装载 Runner 预热镜像
+cd runner
+docker build -t faas-python-runner:latest .
+kind load docker-image faas-python-runner:latest --name faas
+cd ..
+
+# 2. 构建并装载 Gateway 网关镜像
+docker build -t faas-gateway:latest -f gateway/Dockerfile .
+kind load docker-image faas-gateway:latest --name faas
+```
+
+### 3. 部署集群基础组件 (CRD & Gateway)
+
+将我们定义的 Function 资源规范，以及网关服务部署到 K8s 中：
+
+
+
+```bash
+# 部署 CRD
+kubectl apply -f crd.yaml
+
+# 部署 Gateway (包含 Namespace, RBAC, Deployment 和 Service)
+kubectl apply -f gateway-deploy.yaml
+
+# 检查 Gateway 是否就绪
+kubectl get pods -n faas-system
+```
+
+### 4. 启动 FaaS Operator (控制面)
+
+在本地终端中直接启动 Operator（它会自动读取 `~/.kube/config` 连接到 kind 集群）。 *⚠️ 注意：请保持此终端开启，不要关闭。*
+
+```bash
+# 确保在 venv 环境下，并取消可能存在的系统代理以免影响 K8s API 通信
+unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY
+
+kopf run operator/main.py --namespace default
+```
+
+## 🎯 体验 Serverless 冷启动
+
+现在，你的 FaaS 平台已经就绪！我们将部署一个名为 `hello` 的函数，并体验它从 0 副本自动扩容的神奇过程。
+
+### 1. 部署函数
+
+新开一个终端，查看 `function-hello.yaml`，它的 `minReplicas` 配置为 `0`：
+
+```bash
+kubectl apply -f function-hello.yaml
+
+# 此时查看 Pod，你会发现没有任何 hello 函数的实例在运行（Scale to Zero）
+kubectl get deploy,pod -l [faas.example.com/function=hello](https://faas.example.com/function=hello) -n default
+```
+
+### 2. 触发调用
+
+我们需要将集群内 Gateway 的端口映射到宿主机来模拟外部用户请求：
+
+```bash
+kubectl port-forward svc/faas-gateway 8000:8000 -n faas-system
+```
+
+再新开一个终端，发起请求：
+
+```bash
+curl http://localhost:8000/invoke/hello
+```
+
+### 3. 见证奇迹的时刻
+
+当上述 `curl` 命令发出时，你会观察到：
+
+1. 请求会被 Gateway 拦截并挂起。
+2. Operator 终端中会打印出扩容日志。
+3. K8s 中瞬间拉起一个 `fn-hello-deploy-xxx` 的 Pod。
+4. Pod 就绪（毫秒级注入代码）后，终端成功返回：`hello from runner`！
+
+之后再次执行 `curl`，请求将瞬间返回，因为预热容器已经在线。
+
+### 这个版本为什么更好？
+
+1. **彻底分离了镜像构建和部署**：把 Runner 和 Gateway 两个镜像的构建放在了同一站，逻辑更紧凑。
+2. **隐藏了本地联调的复杂环境变量**：简历项目展示的是**“你的成果”**，面试官只想知道在 K8s 里怎么跑通，之前那些 `FAAS_IN_CLUSTER=false` 和繁杂的 `export` 会让人觉得系统不够云原生。
+3. **凸显了亮点**：把你的“毫秒级冷启动”和“Scale-to-Zero”体验过程变成了剧本式的操作，给克隆你代码的人一种极强的成就感。
