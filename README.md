@@ -119,3 +119,52 @@ curl http://localhost:8000/invoke/hello
 1. **彻底分离了镜像构建和部署**：把 Runner 和 Gateway 两个镜像的构建放在了同一站，逻辑更紧凑。
 2. **隐藏了本地联调的复杂环境变量**：简历项目展示的是**“你的成果”**，面试官只想知道在 K8s 里怎么跑通，之前那些 `FAAS_IN_CLUSTER=false` 和繁杂的 `export` 会让人觉得系统不够云原生。
 3. **凸显了亮点**：把你的“毫秒级冷启动”和“Scale-to-Zero”体验过程变成了剧本式的操作，给克隆你代码的人一种极强的成就感。
+
+### 场景二：原生 HPA 自动扩缩容 (1 -> N)
+
+我们在后台发起并发死循环请求（模拟 CPU 飙升）：
+
+修改函数配置为：minReplicas: 1, maxReplicas: 5
+
+可以利用压测工具（如 hey 或 apache bench）或并发脚本对网关施压
+
+查看 K8s 原生 HPA 状态，见证 Pod 从 1 自动扩容到 N 的过程：
+
+```bash
+kubectl get hpa
+kubectl get pods -w
+```
+
+1. **终端 A（观察网关转发）**：确保你的 port-forward 还在运行着。
+
+   Bash
+
+   ```bash
+   kubectl port-forward svc/faas-gateway 8000:8000 -n faas-system
+   ```
+
+2. **终端 B（实时观察 K8s 指标）**：开启这个监控命令，它每 2 秒刷新一次，你可以亲眼看到 CPU 使用率破表，以及 Pod 数量的增加。
+
+   Bash
+
+   ```bash
+   watch -n 2 "kubectl get hpa; echo ''; kubectl get pods -l faas.example.com/function=cpu-test"
+   ```
+
+   *(最开始你应该只看到 1 个 Pod，且 HPA 的 TARGETS 栏显示大概 `0%/50%`)*
+
+3. **终端 C（发起总攻）**：在这个窗口运行你的压测脚本！
+
+   Bash
+
+   ```bash
+   source venv/bin/activate
+   python stress_test.py
+   ```
+
+### 你将会观察到什么现象？
+
+1. 脚本跑起来大概 15 秒后（K8s 采集指标需要一点时间），你会看到终端 B 里的 HPA TARGETS 飙升到了 `100%/50%` 甚至更高。
+2. 紧接着，K8s 会果断出手，下面的 Pod 列表会瞬间从 1 个变成 2 个，再变成 4 个、5 个（达到你设定的 `maxReplicas` 上限）。
+3. 60 秒后压测脚本结束，流量停止。
+4. 再等大约 5 分钟（K8s 原生的缩容冷却期，防止网络抖动导致频繁起停），多余的 Pod 会自动被销毁，再次缩回 1 个副本。
