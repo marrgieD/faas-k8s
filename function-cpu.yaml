@@ -1,0 +1,22 @@
+apiVersion: faas.example.com/v1alpha1
+kind: Function
+metadata:
+  name: cpu-test
+  namespace: default
+spec:
+  runtime: python3.9
+  minReplicas: 1
+  maxReplicas: 5
+  code: |
+    def main(event):
+        # 暴力计算 5000 以内的质数，用来故意消耗 CPU
+        count = 0
+        for num in range(2, 5000):
+            is_prime = True
+            for i in range(2, num):
+                if (num % i) == 0:
+                    is_prime = False
+                    break
+            if is_prime:
+                count += 1
+        return {"status": "success", "primes_found": count}

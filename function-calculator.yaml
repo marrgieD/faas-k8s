@@ -2,12 +2,16 @@
 apiVersion: faas.example.com/v1alpha1
 kind: Function
 metadata:
-  name: hello
+  name: calculator
   namespace: default
 spec:
   code: |
     def main():
-      return "hello from runner"
+      a = 1
+      b = 2
+      c = a + b
+      print(" c: ", c)
+      return c
   runtime: python3.9
   minReplicas: 0
   maxReplicas: 3

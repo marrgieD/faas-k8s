@@ -19,6 +19,7 @@ DEFAULT_PORT = int(os.getenv("FAAS_SERVICE_PORT", "8080"))
 
 # 全局 K8s 客户端，在 startup 时初始化
 apps_v1_api: Optional[client.AppsV1Api] = None
+autoscaling_v2_api: Optional[client.AutoscalingV2Api] = None
 core_v1_api: Optional[client.CoreV1Api] = None
 
 # 配置日志
@@ -394,6 +395,78 @@ def upsert_service(
 
     return name
 
+def build_hpa_body(
+    name: str,
+    namespace: str,
+    spec: Dict[str, Any],
+    deploy_name: str,
+    owner: Dict[str, Any],
+) -> client.V2HorizontalPodAutoscaler:
+    """生成 HPA 配置：当 CPU 超过 50% 时自动扩容"""
+    min_replicas = max(1, spec.get("minReplicas", 1)) # HPA必须至少为1
+    max_replicas = spec.get("maxReplicas", 3)
+
+    metadata = client.V1ObjectMeta(
+        name=name,
+        namespace=namespace,
+        labels={"app.kubernetes.io/managed-by": "faas-operator"},
+        owner_references=[
+            client.V1OwnerReference(
+                api_version=f"{CRD_GROUP}/{CRD_VERSION}",
+                kind="Function",
+                name=owner["metadata"]["name"],
+                uid=owner["metadata"]["uid"],
+                controller=True,
+                block_owner_deletion=True,
+            )
+        ],
+    )
+
+    hpa_spec = client.V2HorizontalPodAutoscalerSpec(
+        scale_target_ref=client.V2CrossVersionObjectReference(
+            api_version="apps/v1",
+            kind="Deployment",
+            name=deploy_name,
+        ),
+        min_replicas=min_replicas,
+        max_replicas=max_replicas,
+        metrics=[
+            client.V2MetricSpec(
+                type="Resource",
+                resource=client.V2ResourceMetricSource(
+                    name="cpu",
+                    target=client.V2MetricTarget(
+                        type="Utilization",
+                        average_utilization=50  # 阈值：50% CPU
+                    ),
+                ),
+            )
+        ],
+    )
+
+    return client.V2HorizontalPodAutoscaler(
+        api_version="autoscaling/v2",
+        kind="HorizontalPodAutoscaler",
+        metadata=metadata,
+        spec=hpa_spec,
+    )
+
+def upsert_hpa(namespace: str, body: client.V2HorizontalPodAutoscaler, logger_: logging.Logger) -> str:
+    """创建或更新 HPA（幂等）"""
+    assert autoscaling_v2_api is not None
+    name = body.metadata.name
+
+    try:
+        autoscaling_v2_api.read_namespaced_horizontal_pod_autoscaler(name=name, namespace=namespace)
+        logger_.info("HPA %s 已存在，执行 patch。", name)
+        autoscaling_v2_api.patch_namespaced_horizontal_pod_autoscaler(name=name, namespace=namespace, body=body)
+    except ApiException as e:
+        if e.status == 404:
+            logger_.info("HPA %s 不存在，执行 create。", name)
+            autoscaling_v2_api.create_namespaced_horizontal_pod_autoscaler(namespace=namespace, body=body)
+        else:
+            raise kopf.TemporaryError(f"读取/更新 HPA 失败: {e}", delay=30)
+    return name
 
 def update_status(
     name: str,
@@ -461,6 +534,17 @@ def reconcile_function(
     )
     svc_name = upsert_service(namespace=namespace, body=svc_body, logger_=logger_)
 
+    # 4. 新增：注入 HPA (只有当 maxReplicas > 1 且 minReplicas >= 1 时，才启用 HPA)
+    if spec.get("maxReplicas", 1) > 1 and spec.get("minReplicas", 0) >= 1:
+        hpa_body = build_hpa_body(
+            name=f"{names['deployment']}-hpa",
+            namespace=namespace,
+            spec=spec,
+            deploy_name=deploy_name,
+            owner=body,
+        )
+        upsert_hpa(namespace=namespace, body=hpa_body, logger_=logger_)
+
     update_status(
         name=name,
         namespace=namespace,
@@ -498,12 +582,13 @@ def startup(logger: logging.Logger, **_: Any) -> None:
     """
     Operator 启动时调用：初始化 K8s 客户端与 Kopf 设置。
     """
-    global apps_v1_api, core_v1_api
+    global apps_v1_api, core_v1_api, autoscaling_v2_api 
 
     logger.info("FaaS Operator 正在启动，初始化 Kubernetes 客户端...")
     load_kube_config()
     apps_v1_api = client.AppsV1Api()
     core_v1_api = client.CoreV1Api()
+    autoscaling_v2_api = client.AutoscalingV2Api()  
     logger.info("Kubernetes 客户端初始化完成。")
 
 
